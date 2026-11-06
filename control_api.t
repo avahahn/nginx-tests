@@ -17,6 +17,7 @@ BEGIN { use FindBin; chdir($FindBin::Bin); }
 
 use lib 'lib';
 use Test::Nginx qw/ :DEFAULT http_end /;
+use POSIX qw(mkfifo);
 
 ###############################################################################
 
@@ -60,7 +61,7 @@ $t->write_file('inc.conf', '#inc.conf');
 my $d = $t->testdir();
 my $p = port(8080);
 
-$t->args('-l', '127.0.0.1:' . $p)->run()->plan(96);
+$t->args('-l', '127.0.0.1:' . $p)->run()->plan(103);
 
 my $v = (sort { $a <=> $b } @{ api() })[-1];
 
@@ -271,6 +272,108 @@ like(http("GET /$v/nginx\r\nX: y HTTP/1.0" . CRLF . CRLF), qr/ 400/,
 like(http("GET /$v/\xd0\xb0\xd0\xb1\xd0\xb2 HTTP/1.0" . CRLF), qr/ 404/,
 	'UTF-8 bytes in URI');
 like(http("\xff\xfe" . CRLF), qr/ 400/, 'binary garbage');
+
+# Control API configuration check endpoint tests
+my $bad_directive_conf = <<'EOF';
+
+%%TEST_GLOBALS%%
+
+daemon off;
+
+events {
+}
+
+http {
+    %%TEST_GLOBALS_HTTP%%
+
+    bad_directive;
+
+    server {
+        listen 127.0.0.1:8081;
+        server_name  localhost;
+
+        location / {
+            return 200 "%%RETURN%%";
+        }
+    }
+}
+
+EOF
+
+my $bad_listen_conf = <<'EOF';
+
+%%TEST_GLOBALS%%
+
+daemon off;
+
+events {
+}
+
+http {
+    %%TEST_GLOBALS_HTTP%%
+
+    server {
+        listen 127.0.0.1:8;
+        server_name  localhost;
+
+        location / {
+            return 200 "%%RETURN%%";
+        }
+    }
+}
+
+EOF
+
+my $fifo_conf = <<'EOF';
+
+%%TEST_GLOBALS%%
+
+daemon off;
+
+include fifo.conf;
+
+http {
+    %%TEST_GLOBALS_HTTP%%
+
+    server {
+        listen 127.0.0.1:8081;
+        server_name  localhost;
+
+        location / {
+            return 200 "%%RETURN%%";
+        }
+    }
+}
+
+EOF
+
+like(get("/control/config/check"), qr/ 200 OK/, 'config check passes');
+
+$t->write_file_expand('nginx.conf', $bad_directive_conf);
+like(get("/control/config/check"), qr/ 422 Unprocessable/, 'config check fails: directive');
+
+$t->write_file_expand('nginx.conf', $bad_listen_conf);
+like(get("/control/config/check"), qr/ 422 Unprocessable/, 'config check fails: listen port');
+
+my $fifo_path = $t->testdir() . '/' . "fifo.conf";
+$t->write_file_expand('nginx.conf', $fifo_conf);
+$t->write_file_expand('fifo.conf', "events {}");
+like(http_patch("/control/config"), qr/ 200 OK/, 'timeout test config prep');
+unlink $fifo_path;
+
+mkfifo($fifo_path, 0600) or die "mkfifo $fifo_path: $!";
+my $kid = fork() // die "fork: $!";
+if ($kid == 0) {
+    open my $w, "+>", $fifo_path or die "config writer open: $!";
+    sleep 35; # control API process timeout: 30 seconds
+    print $w "events {}";
+    close $w;
+    exit 0;
+}
+$t->waitforfile($fifo_path);
+like(get("/control/config/check"), qr/ 408/, 'reload config timeout');
+waitpid($kid, 0);
+unlink($fifo_path);
 
 ###############################################################################
 
