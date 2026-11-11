@@ -60,7 +60,7 @@ $t->write_file('inc.conf', '#inc.conf');
 my $d = $t->testdir();
 my $p = port(8080);
 
-$t->args('-l', '127.0.0.1:' . $p)->run()->plan(96);
+$t->args('-l', '127.0.0.1:' . $p)->run()->plan(114);
 
 my $v = (sort { $a <=> $b } @{ api() })[-1];
 
@@ -155,6 +155,75 @@ like(api('/control/config')->[0]{content}, qr/bar/, 'in memory config reread');
 is(scalar @{ api('/control/processes') }, scalar @$procs,
 	'exited processes skipped');
 
+my $master = $t->read_file('nginx.pid');
+
+SKIP: {
+skip 'not yet', 18 unless $t->has_version('1.31.9');
+
+# config check
+
+my $workers = api('/control/processes');
+
+my $r = get('/control/config/check');
+
+like($r, qr/^HTTP\/1.1 200 OK/, 'check');
+is_deeply(body($r), { logs => [] }, 'check no logs');
+like(get('/control/config/check/'), qr/ 200 OK/, 'check trailing slash');
+
+$t->write_file('inc.conf', 'types { text/plain t; text/html t; }');
+
+$r = get('/control/config/check');
+
+like($r, qr/ 200 OK/, 'check warning');
+like(join("\n", @{ body($r)->{logs} // [] }),
+	qr/\[warn\].*duplicate extension/, 'check warning logs');
+
+$t->write_file('inc.conf', 'unknown_directive;');
+
+$r = get('/control/config/check');
+
+my $logs = body($r)->{logs} // [];
+
+like($r, qr/^HTTP\/1.1 422 Unprocessable Entity/, 'check invalid');
+is(scalar @$logs, 1, 'check invalid logs');
+like($logs->[0] // '',
+	qr/\[emerg\] .*unknown directive "unknown_directive" in \Q$d\E/,
+	'check invalid emerg');
+
+$t->write_file('inc.conf', 'include nonexistent.conf;');
+$r = get('/control/config/check');
+
+like($r, qr/ 422 .*nonexistent\.conf.*No such/s, 'check missing include');
+
+$t->write_file_expand('nginx.conf', 'bad config');
+$r = get('/control/config/check');
+
+like($r, qr/ 422 .*unexpected end of file/s, 'check syntax error');
+
+# the check does not apply the configuration
+
+$t->write_file('inc.conf', '#inc.conf');
+$t->write_file_expand('nginx.conf', $conf =~ s/%%RETURN%%/baz/r);
+
+$r = get('/control/config/check');
+
+like($r, qr/ 200 OK/, 'check changed config');
+
+like(http_get('/', PeerAddr => '127.0.0.1:' . port(8081)), qr/bar/,
+	'check config not applied');
+like(api('/control/config')->[0]{content}, qr/bar/,
+	'check in memory config kept');
+is_deeply(api('/control/processes'), $workers, 'check workers kept');
+is($t->read_file('nginx.pid'), $master, 'check pid file kept');
+
+like(get('/control/config/checx'), qr/ 404/, 'unknown check');
+like(get('/control/config/checks'), qr/ 404/, 'longer check');
+
+is(scalar(grep { /^Z/ } `ps -o stat= --ppid $master 2>/dev/null`), 0,
+	'check processes reaped');
+
+}
+
 # connection resilience
 
 http('', start => 1);
@@ -170,8 +239,6 @@ like(raw("inx HTTP/1.0", socket => $s), qr/"version"/,
 	'request split across reads');
 
 # accept queue drained, SIGIO coalesces while blocked
-
-my $master = $t->read_file('nginx.pid');
 
 kill 'STOP', $master;
 my @s = map { get('/nginx', start => 1) } 1 .. 3;
@@ -289,6 +356,14 @@ sub api_patch {
 	my ($body) = http_patch($uri) =~ /.*?\x0d\x0a?\x0d\x0a?(.*)/ms;
 
 	return JSON::PP::decode_json($body);
+}
+
+sub body {
+	my ($r) = @_;
+
+	my ($body) = $r =~ /.*?\x0d\x0a?\x0d\x0a?(.*)/ms;
+
+	return eval { JSON::PP::decode_json($body) } // {};
 }
 
 sub get {
