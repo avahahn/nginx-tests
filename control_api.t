@@ -60,7 +60,7 @@ $t->write_file('inc.conf', '#inc.conf');
 my $d = $t->testdir();
 my $p = port(8080);
 
-$t->args('-l', '127.0.0.1:' . $p)->run()->plan(114);
+$t->args('-l', '127.0.0.1:' . $p)->run()->plan(115);
 
 my $v = (sort { $a <=> $b } @{ api() })[-1];
 
@@ -189,6 +189,23 @@ is(scalar @$logs, 1, 'check invalid logs');
 like($logs->[0] // '',
 	qr/\[emerg\] .*unknown directive "unknown_directive" in \Q$d\E/,
 	'check invalid emerg');
+
+
+my $bad_listener = <<'EOF';
+server {
+	listen 127.0.0.1:8;
+	server_name  localhost;
+
+	location / {
+		return 200 "OK";
+	}
+}
+EOF
+
+$t->write_file('inc.conf', $bad_listener);
+$r = get('/control/config/check');
+
+like($r, qr/ 422 /, 'check socket permissions issue');
 
 $t->write_file('inc.conf', 'include nonexistent.conf;');
 $r = get('/control/config/check');
